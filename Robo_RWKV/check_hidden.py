@@ -174,7 +174,7 @@ def interactive_demo(args):
             print(f"  - Min value: {global_condition.min().item():.4f}")
             print(f"  - Max value: {global_condition.max().item():.4f}")
             print(f"  - Mean value: {global_condition.mean().item():.4f}")
-            print(f"  - First 5 values: {global_condition.squeeze()[:5].cpu().numpy()}")
+            print(f"  - First 5 values: {global_condition.squeeze()[:5].cpu().float().numpy()}")
             print("-------------------------")
             
             expected_shape = (1, args.n_embd) # Batch size is 1
@@ -214,14 +214,14 @@ if __name__ == "__main__":
     parser.add_argument("--grad_cp", default=0, type=int)
     
     # --- VisualRWKV (CLIP version) specific arguments ---
-    parser.add_argument("--vision_tower_name", default="/root/zhihuieye/link2data/gyc_SV/VLA/weights/clip-vit-large-patch14-336/", type=str)
+    parser.add_argument("--vision_tower_name", default="/home/bgi/code/VLA/weights/CLIP", type=str)
     parser.add_argument("--grid_size", type=int, default=-1)
     parser.add_argument("--detail", type=str, default="low", choices=['low', 'high'])
     parser.add_argument("--image_position", default='first', type=str, choices=['first', 'last', 'middle'])
     parser.add_argument("--tokenizer_path", type=str, default="src/rwkv_vocab_v20230424.txt")
 
     # --- Demo specific arguments ---
-    parser.add_argument("--model_path", type=str, default="/root/zhihuieye/link2data/gyc_SV/VLA/weights/VisualRWKV-v060-1B6-v1.0-20240612.pth")
+    parser.add_argument("--model_path", type=str, default="/home/bgi/code/VLA/weights/VisualRWKV-v060-1B6-v1.0-20240612.pth")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--max_new_tokens", type=int, default=128)
