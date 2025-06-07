@@ -52,6 +52,7 @@ class RWKVDroidPolicy(nn.Module):
         
         # 保存动作/状态配置
         self.action_dim = action_dim
+        self.state_dim = state_dim # 保存状态维度，推理时需要
         self.action_horizon = action_horizon
         self.num_inference_steps = num_inference_steps
         
@@ -90,7 +91,7 @@ class RWKVDroidPolicy(nn.Module):
         self.noise_scheduler = DDIMScheduler(
             num_train_timesteps=num_train_timesteps,
             beta_schedule=beta_schedule,
-            clip_sample=True,
+            clip_sample=True, # 建议开启，防止动作值超出范围
             set_alpha_to_one=True,
             steps_offset=0,
             prediction_type=prediction_type
@@ -169,10 +170,69 @@ class RWKVDroidPolicy(nn.Module):
         
         return predicted_noise, noise
 
+    @torch.no_grad()
+    def plan_action(self, image_input, text_instruction, robot_state):
+        """
+        推理/规划函数，用于在实际环境中生成动作序列。
+        
+        Args:
+            image_input (torch.Tensor): 单帧图像, shape: [1, 1, C, H, W]
+            text_instruction (str): 单个文本指令, e.g. "pick up the red block"
+            robot_state (torch.Tensor): 当前机器人状态, shape: [1, state_dim]
+            
+        Returns:
+            torch.Tensor: 规划出的动作序列, shape: [1, action_horizon, action_dim]
+        """
+        # 确保模型处于评估模式
+        self.eval()
+        device = image_input.device
+        dtype = next(self.diffusion_head.parameters()).dtype # 获取diffusion head的数据类型 (bfloat16)
+
+        # 1. 使用VLM提取全局条件
+        # 注意：这里我们把单个指令包装成一个列表，以匹配_prepare_vlm_input的输入要求
+        samples = self._prepare_vlm_input(image_input, [text_instruction], device)
+        global_condition = self.vlm.get_global_condition(samples)
+        
+        # 2. 准备去噪过程的初始输入
+        # 初始化一个纯噪声张量作为动作序列的起点
+        noisy_actions = torch.randn(
+            (1, self.action_horizon, self.action_dim), 
+            device=device, 
+            dtype=dtype
+        )
+        # 将机器人状态转换为正确的类型和设备
+        robot_state = robot_state.to(device=device, dtype=dtype)
+
+        # 3. 设置调度器的时间步
+        self.noise_scheduler.set_timesteps(self.num_inference_steps)
+
+        # 4. 逐步去噪循环
+        for t in self.noise_scheduler.timesteps:
+            # 预测当前时间步的噪声
+            # 注意：timestep也需要是一个tensor
+            timestep_tensor = t.unsqueeze(0).to(device)
+            
+            predicted_noise = self.diffusion_head(
+                sample=noisy_actions,
+                timestep=timestep_tensor,
+                global_cond=global_condition,
+                states=robot_state
+            )
+            
+            # 使用调度器的step方法，从当前带噪动作中移除预测的噪声
+            # 得到一个更清晰的动作序列
+            noisy_actions = self.noise_scheduler.step(
+                model_output=predicted_noise,
+                timestep=t,
+                sample=noisy_actions
+            ).prev_sample
+
+        # 5. 返回最终去噪后的动作序列
+        return noisy_actions
+
 # ====================================================================================
 #                           主测试用例 (使用真实组件)
-# ====================================================================================
-
+# ===================================================================================
 if __name__ == '__main__':
     print("="*60)
     print("RUNNING RWKVDroidPolicy REAL INTEGRATION TEST")
@@ -186,36 +246,26 @@ if __name__ == '__main__':
     # ##################################################################
 
     # --- 1. 设置测试参数 ---
-    ACTION_DIM = 7  # 例如: 6-DoF末端执行器 + 1夹爪状态
-    STATE_DIM = 7   # 例如: 机器人自身的本体感受状态
+    ACTION_DIM = 7
+    STATE_DIM = 7
     ACTION_HORIZON = 16
-    BATCH_SIZE = 2  # 使用一个较小的批次大小以避免内存问题
+    BATCH_SIZE = 2
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Test Configuration:")
     print(f"  - Device: {DEVICE}")
-    print(f"  - Batch Size: {BATCH_SIZE}")
+    print(f"  - Batch Size (for training test): {BATCH_SIZE}")
     print(f"  - Action Dim: {ACTION_DIM}")
     print(f"  - State Dim: {STATE_DIM}")
     print(f"  - VLM Model: {VLM_MODEL_PATH}")
     print(f"  - Tokenizer: {TOKENIZER_PATH}")
 
-    # --- 2. 创建VLM所需的配置对象 (模仿您的demo.py) ---
+    # --- 2. 创建VLM所需的配置对象 ---
     vlm_config_args = argparse.Namespace(
-        n_layer=24,
-        n_embd=2048,
-        ctx_len=256, # 可以根据需要调整
-        vocab_size=65536,
-        load_model="",
-        vision_tower_name="/home/bgi/code/VLA/weights/CLIP",
-        dim_att=2048,
-        dim_ffn=7168,
-        pre_ffn=0,
-        head_size_a=64,
-        head_size_divisor=8,
-        dropout=0.0,
-        grad_cp=0,
-        grid_size=-1,
+        n_layer=24, n_embd=2048, ctx_len=256, vocab_size=65536,
+        load_model="", vision_tower_name="/home/bgi/code/VLA/weights/CLIP",
+        dim_att=2048, dim_ffn=7168, pre_ffn=0, head_size_a=64,
+        head_size_divisor=8, dropout=0.0, grad_cp=0, grid_size=-1,
         image_position='first'
     )
     os.environ["RWKV_HEAD_SIZE_A"] = str(vlm_config_args.head_size_a)
@@ -230,10 +280,6 @@ if __name__ == '__main__':
             state_dim=STATE_DIM,
             action_horizon=ACTION_HORIZON
         ).to(DEVICE)
-    except FileNotFoundError as e:
-        print(f"[ERROR] 文件未找到: {e}")
-        print("请确保上面的 VLM_MODEL_PATH 和 TOKENIZER_PATH 是正确的。")
-        exit()
     except Exception as e:
         print(f"[ERROR] 初始化 RWKVDroidPolicy 时出错: {e}")
         import traceback
@@ -242,41 +288,66 @@ if __name__ == '__main__':
         
     print("--- RWKVDroidPolicy Initialized Successfully ---")
 
-    # --- 4. 创建随机输入数据 ---
-    dummy_image_input = torch.randn(BATCH_SIZE, 1, 3, 336, 336, device=DEVICE)
-    dummy_text_instructions = [f"pick up the red block" for _ in range(BATCH_SIZE)]
-    dummy_robot_state = torch.randn(BATCH_SIZE, STATE_DIM, device=DEVICE, dtype=torch.bfloat16)
-    dummy_ground_truth_actions = torch.randn(BATCH_SIZE, ACTION_HORIZON, ACTION_DIM, device=DEVICE, dtype=torch.bfloat16)
-
+    # ======================== 训练前向传播测试 ========================
     print("--- Testing Training Forward Pass ---")
-    print(f"Input action shape: {dummy_ground_truth_actions.shape}")
     
-    # --- 5. 运行一次前向传播 ---
+    # 创建训练用的批处理数据
+    dummy_train_images = torch.randn(BATCH_SIZE, 1, 3, 336, 336, device=DEVICE)
+    dummy_train_instructions = [f"pick up object {i}" for i in range(BATCH_SIZE)]
+    dummy_train_state = torch.randn(BATCH_SIZE, STATE_DIM, device=DEVICE, dtype=torch.bfloat16)
+    dummy_train_actions = torch.randn(BATCH_SIZE, ACTION_HORIZON, ACTION_DIM, device=DEVICE, dtype=torch.bfloat16)
+    
     try:
-        # 将模型设置为训练模式 (尽管VLM是冻结的，但diffusion head需要)
         policy.train()
-        
         predicted_noise, original_noise = policy.forward(
-            image_input=dummy_image_input,
-            text_instructions=dummy_text_instructions,
-            robot_state=dummy_robot_state,
-            ground_truth_actions=dummy_ground_truth_actions
+            image_input=dummy_train_images,
+            text_instructions=dummy_train_instructions,
+            robot_state=dummy_train_state,
+            ground_truth_actions=dummy_train_actions
         )
-        
-        print("--- FORWARD PASS COMPLETED ---")
+        print("--- TRAINING FORWARD PASS COMPLETED ---")
         print(f"Output predicted_noise shape: {predicted_noise.shape}")
+        assert predicted_noise.shape == dummy_train_actions.shape
+        print("[SUCCESS] Output shape matches ground truth action shape.")
         
-        # --- 6. 验证输出形状 ---
-        assert predicted_noise.shape == dummy_ground_truth_actions.shape
-        print("[SUCCESS] Output shape matches input action shape.")
-        
+    except Exception as e:
         print("" + "="*60)
-        print("🎉 INTEGRATION TEST PASSED! The full forward pass works correctly. 🎉")
+        print("❌ TRAINING TEST FAILED! An error occurred:")
+        import traceback
+        traceback.print_exc()
+        exit()
+
+    print("" + "="*60 + "")
+
+    # ======================== 推理/规划函数测试 ========================
+    print("--- Testing Inference/Planning Function (plan_action) ---")
+    
+    # 创建推理用的单样本数据
+    dummy_inference_image = torch.randn(1, 1, 3, 336, 336, device=DEVICE)
+    dummy_inference_instruction = "put the green cup into the sink"
+    dummy_inference_state = torch.randn(1, STATE_DIM, device=DEVICE)
+
+    try:
+        planned_actions = policy.plan_action(
+            image_input=dummy_inference_image,
+            text_instruction=dummy_inference_instruction,
+            robot_state=dummy_inference_state
+        )
+        print("--- INFERENCE (plan_action) COMPLETED ---")
+        print(f"Output planned_actions shape: {planned_actions.shape}")
+        
+        # 验证输出形状
+        expected_shape = (1, ACTION_HORIZON, ACTION_DIM)
+        assert planned_actions.shape == expected_shape
+        print(f"[SUCCESS] Output shape {planned_actions.shape} matches expected shape {expected_shape}.")
+
+        print("" + "="*60)
+        print("🎉 ALL TESTS PASSED! The model works for both training and inference. 🎉")
         print("="*60)
 
     except Exception as e:
         print("" + "="*60)
-        print("❌ TEST FAILED! An error occurred during the forward pass:")
+        print("❌ INFERENCE TEST FAILED! An error occurred in plan_action:")
         import traceback
         traceback.print_exc()
-        print("="*60)
+        exit()
