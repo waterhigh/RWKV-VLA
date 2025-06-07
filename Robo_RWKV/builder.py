@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 import os
+os.environ["RWKV_JIT_ON"] = "1" 
+os.environ["RWKV_HEAD_SIZE_A"] = str(64)
+os.environ["RWKV_CTXLEN"] = str(256) 
 import argparse # 用于为测试创建配置对象
 
 # ====================================================================================
@@ -81,6 +84,8 @@ class RWKVDroidPolicy(nn.Module):
             n_groups=n_groups
         )
         
+        self.diffusion_head.to(dtype=torch.bfloat16)
+
         # 4. 初始化噪声调度器
         self.noise_scheduler = DDIMScheduler(
             num_train_timesteps=num_train_timesteps,
@@ -201,6 +206,8 @@ if __name__ == '__main__':
         n_embd=2048,
         ctx_len=256, # 可以根据需要调整
         vocab_size=65536,
+        load_model="",
+        vision_tower_name="/home/bgi/code/VLA/weights/CLIP",
         dim_att=2048,
         dim_ffn=7168,
         pre_ffn=0,
@@ -236,7 +243,7 @@ if __name__ == '__main__':
     print("--- RWKVDroidPolicy Initialized Successfully ---")
 
     # --- 4. 创建随机输入数据 ---
-    dummy_image_input = torch.randn(BATCH_SIZE, 3, 224, 224, device=DEVICE)
+    dummy_image_input = torch.randn(BATCH_SIZE, 1, 3, 336, 336, device=DEVICE)
     dummy_text_instructions = [f"pick up the red block" for _ in range(BATCH_SIZE)]
     dummy_robot_state = torch.randn(BATCH_SIZE, STATE_DIM, device=DEVICE, dtype=torch.bfloat16)
     dummy_ground_truth_actions = torch.randn(BATCH_SIZE, ACTION_HORIZON, ACTION_DIM, device=DEVICE, dtype=torch.bfloat16)
